@@ -1,9 +1,12 @@
 // ==UserScript==
 // @name         MoveItems Bulk Move Assistant - NCL1
 // @namespace    PrinceJacob-Amazon
-// @version      2.0.0
+// @version      2.0.1
 // @description  Ultra compact bulk helper for AFT MoveItems with presets, responsive/resizable UI, white inputs, FCResearch tab-bridge CUSTOMER_SHIPMENT auto-fill, FNSKU auto-clear, auto-resume, qty list, and auto Change container.
 // @author       Prince Jacob (Wprijaco)
+// @updateURL    https://github.com/prince-jacob/MoveItemsBulkMoveAssistant/raw/refs/heads/main/MoveItemsBulkMoveAssistant.user.js
+// @downloadURL  https://github.com/prince-jacob/MoveItemsBulkMoveAssistant/raw/refs/heads/main/MoveItemsBulkMoveAssistant.user.js
+// @homepageURL  https://github.com/prince-jacob/MoveItemsBulkMoveAssistant
 // @match        https://aft-qt-eu.aka.amazon.com/app/moveitems*
 // @match        https://qi-fcresearch-eu.corp.amazon.com/NCL1/*
 // @match        file:///*MoveItemsApp*.html

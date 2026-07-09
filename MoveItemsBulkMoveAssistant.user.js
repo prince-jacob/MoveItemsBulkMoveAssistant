@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MoveItems Bulk Move Assistant - NCL1
 // @namespace    PrinceJacob-Amazon
-// @version      2.0.1
+// @version      2.0.2
 // @description  Ultra compact bulk helper for AFT MoveItems with presets, responsive/resizable UI, white inputs, FCResearch tab-bridge CUSTOMER_SHIPMENT auto-fill, FNSKU auto-clear, auto-resume, qty list, and auto Change container.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://github.com/prince-jacob/MoveItemsBulkMoveAssistant/raw/refs/heads/main/MoveItemsBulkMoveAssistant.user.js
@@ -19,7 +19,10 @@
 // @grant        GM_deleteValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_openInTab
+// @grant        GM_info
 // @connect      qi-fcresearch-eu.corp.amazon.com
+// @connect      github.com
+// @connect      raw.githubusercontent.com
 // ==/UserScript==
 
 (function () {
@@ -1552,6 +1555,80 @@ B012345678 x2">${escapeHtml(saved.list || '')}</textarea>
       document.body.style.userSelect = '';
     });
   }
+
+
+  // ===== Prince Jacob Custom Update Checker - Every 10 Hours =====
+  function princeUpdateChecker() {
+    const UPDATE_URL = "https://github.com/prince-jacob/MoveItemsBulkMoveAssistant/raw/refs/heads/main/MoveItemsBulkMoveAssistant.user.js";
+    const CHECK_KEY = "prince_last_update_check_" + (GM_info?.script?.name || "MoveItemsBulkMoveAssistant");
+    const CHECK_INTERVAL = 10 * 60 * 60 * 1000; // 10 hours
+
+    if (typeof GM_xmlhttpRequest !== 'function' || typeof GM_getValue !== 'function' || typeof GM_setValue !== 'function') {
+      console.log('[Update Checker] GM_* functions unavailable.');
+      return;
+    }
+
+    const lastCheck = Number(GM_getValue(CHECK_KEY, 0));
+    const now = Date.now();
+
+    // Skip if already checked within the last 10 hours
+    if (now - lastCheck < CHECK_INTERVAL) return;
+
+    GM_setValue(CHECK_KEY, now);
+
+    GM_xmlhttpRequest({
+      method: 'GET',
+      url: UPDATE_URL,
+      nocache: true,
+      onload: function (res) {
+        const remoteScript = res.responseText || '';
+        const remoteMatch = remoteScript.match(/\/\/\s*@version\s+([0-9.]+)/i);
+
+        if (!remoteMatch) {
+          console.log('[Update Checker] Remote version not found.');
+          return;
+        }
+
+        const remoteVersion = remoteMatch[1];
+        const currentVersion = GM_info?.script?.version || '0.0.0';
+
+        if (isNewerVersion(remoteVersion, currentVersion)) {
+          const openUpdate = confirm(
+            'New script update available!\n\n' +
+            'Script: ' + (GM_info?.script?.name || 'MoveItems Bulk Move Assistant') + '\n' +
+            'Current version: ' + currentVersion + '\n' +
+            'New version: ' + remoteVersion + '\n\n' +
+            'Open update page now?'
+          );
+
+          if (openUpdate) window.open(UPDATE_URL, '_blank');
+        } else {
+          console.log('[Update Checker] Up to date:', currentVersion);
+        }
+      },
+      onerror: function () {
+        console.log('[Update Checker] Failed to check update.');
+      }
+    });
+
+    function isNewerVersion(remote, current) {
+      const r = String(remote).split('.').map(Number);
+      const c = String(current).split('.').map(Number);
+      const len = Math.max(r.length, c.length);
+
+      for (let i = 0; i < len; i++) {
+        const rv = r[i] || 0;
+        const cv = c[i] || 0;
+
+        if (rv > cv) return true;
+        if (rv < cv) return false;
+      }
+
+      return false;
+    }
+  }
+
+  princeUpdateChecker();
 
   if (IS_FCRESEARCH_PAGE) {
     runFcResearchBridgePage();

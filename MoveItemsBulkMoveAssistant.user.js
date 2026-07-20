@@ -2,7 +2,7 @@
 // @name         MoveItems Bulk Move Assistant - NCL1
 // @namespace    PrinceJacob-Amazon
 // @version      2.1.0
-// @description  Ultra compact bulk helper for AFT MoveItems with presets, responsive/resizable UI, white inputs, FCResearch direct Inventory API CUSTOMER_SHIPMENT auto-fill with tab fallback, FNSKU auto-clear, auto-resume, qty list, and auto Change container.
+// @description  Ultra compact bulk helper for AFT MoveItems with optional backend API mode, FCResearch tab-bridge CUSTOMER_SHIPMENT auto-fill, presets, qty list, auto-resume, and auto Change container.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://github.com/prince-jacob/MoveItemsBulkMoveAssistant/raw/refs/heads/main/MoveItemsBulkMoveAssistant.user.js
 // @downloadURL  https://github.com/prince-jacob/MoveItemsBulkMoveAssistant/raw/refs/heads/main/MoveItemsBulkMoveAssistant.user.js
@@ -31,8 +31,8 @@
   /**********************************************************************
    * MoveItems Bulk Move Assistant
    * - This script does NOT store cookies/tokens.
-   * - This script does NOT call hidden APIs for moving stock.
-   * - It submits the current MoveItems input box like a normal scanner.
+   * - Default v2.1 can use backend mode based on captured MoveItems /action + /status calls.
+   * - Normal page-input mode is still available in settings.
    * - On file:// saved HTML it runs in test/view mode only.
    **********************************************************************/
 
@@ -243,6 +243,7 @@
       pauseErrors: $('#mib-pauseerrors')?.checked ?? true,
       skipSourceIfPresent: $('#mib-skipsource')?.checked ?? true,
       smartWait: $('#mib-smartwait')?.checked ?? true,
+      backendMode: $('#mib-backendmode')?.checked ?? true,
       autoChangeContainer: $('#mib-autochangec')?.checked ?? true,
       fcAutoFetch: $('#mib-autofcfetch')?.checked ?? true,
       sourcePresets: $('#mib-source-presets')?.value || '',
@@ -277,6 +278,7 @@
       pauseErrors: $('#mib-pauseerrors')?.checked ?? saved.pauseErrors ?? true,
       skipSourceIfPresent: $('#mib-skipsource')?.checked ?? saved.skipSourceIfPresent ?? true,
       smartWait: $('#mib-smartwait')?.checked ?? saved.smartWait ?? true,
+      backendMode: $('#mib-backendmode')?.checked ?? saved.backendMode ?? true,
       autoChangeContainer: $('#mib-autochangec')?.checked ?? saved.autoChangeContainer ?? true,
       fcAutoFetch: $('#mib-autofcfetch')?.checked ?? saved.fcAutoFetch ?? true,
       sourcePresets: $('#mib-source-presets')?.value ?? saved.sourcePresets ?? '',
@@ -302,6 +304,7 @@
     if ($('#mib-pauseerrors')) $('#mib-pauseerrors').checked = run.pauseErrors !== false;
     if ($('#mib-skipsource')) $('#mib-skipsource').checked = run.skipSourceIfPresent !== false;
     if ($('#mib-smartwait')) $('#mib-smartwait').checked = run.smartWait !== false;
+    if ($('#mib-backendmode')) $('#mib-backendmode').checked = run.backendMode !== false;
     if ($('#mib-autochangec')) $('#mib-autochangec').checked = run.autoChangeContainer !== false;
     if ($('#mib-autofcfetch')) $('#mib-autofcfetch').checked = run.fcAutoFetch !== false;
     const saved = getSaved();
@@ -351,7 +354,11 @@
 
     setStatus(`Auto-resuming after page refresh: ${state.index}/${state.queue.length}...`);
     addLog(`Auto-resume after refresh. Last step: ${run.lastStep || 'unknown'}.`);
-    setTimeout(() => runLoop(), 1000);
+    setTimeout(() => {
+      const s = getJobSettings();
+      if (s.backendMode) runBackendLoop();
+      else runLoop();
+    }, 1000);
   }
 
   function setStatus(msg, bad = false) {
@@ -591,54 +598,25 @@
     return { lines, customerRows, skippedRows };
   }
 
-  function looksLikeFcResearchLogin(res, body) {
-    const finalUrl = String(res?.finalUrl || res?.responseURL || '');
-    const text = String(body || '');
-    return /midway|signin|sign-in|login|authentication/i.test(finalUrl) ||
-      (/<title[^>]*>[^<]*(midway|sign\s*in|login)/i.test(text) &&
-       !/CUSTOMER_SHIPMENT|UNOWNED|SELLABLE/i.test(text));
-  }
-
-  function gmPostFcResearchInventory(source) {
+  function gmGetText(url) {
     return new Promise((resolve, reject) => {
       if (typeof GM_xmlhttpRequest !== 'function') {
         reject(new Error('GM_xmlhttpRequest not available. Check Tampermonkey permissions.'));
         return;
       }
-
       GM_xmlhttpRequest({
-        method: 'POST',
-        url: 'https://qi-fcresearch-eu.corp.amazon.com/NCL1/results/inventory',
+        method: 'GET',
+        url,
         anonymous: false,
         timeout: 30000,
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest',
-          'Accept': 'text/html, */*; q=0.01'
-        },
-        data: `s=${encodeURIComponent(source)}`,
         onload: res => {
-          const body = res.responseText || '';
-          if (looksLikeFcResearchLogin(res, body)) {
-            reject(new Error('FCResearch authentication is required. Open FCResearch and complete Midway login, then try again.'));
-            return;
-          }
-          if (res.status >= 200 && res.status < 300) {
-            resolve(body);
-            return;
-          }
-          reject(new Error(`FCResearch Inventory returned HTTP ${res.status}`));
+          if (res.status >= 200 && res.status < 300) resolve(res.responseText || '');
+          else reject(new Error(`FCResearch returned HTTP ${res.status}`));
         },
-        ontimeout: () => reject(new Error('FCResearch Inventory request timed out.')),
-        onerror: () => reject(new Error('FCResearch Inventory request failed.'))
+        ontimeout: () => reject(new Error('FCResearch request timed out.')),
+        onerror: () => reject(new Error('FCResearch request failed.'))
       });
     });
-  }
-
-  async function fetchFcResearchDirect(source) {
-    const html = await gmPostFcResearchInventory(source);
-    const parsed = parseFcResearchCustomerShipment(html, source);
-    return { ...parsed, method: 'direct-inventory' };
   }
 
 
@@ -705,42 +683,29 @@
     }
     if (!list) return;
     if (IS_LOCAL_FILE) {
-      setStatus('Local test: FCResearch request works only on the live MoveItems page.', true);
+      setStatus('Local test: FCResearch tab bridge works only on live MoveItems page.', true);
       addLog('Local test: FCResearch fetch skipped.', true);
       return;
     }
 
     const btn = $('#mib-fetchfc');
     if (btn) btn.disabled = true;
-    setStatus(`Requesting FCResearch Inventory for ${source}...`);
-    addLog(`Direct FCResearch Inventory request started for ${source} (${reason}).`);
+    setStatus(`Opening FCResearch tab bridge for ${source}...`);
+    addLog(`FCResearch tab bridge started for ${source} (${reason}).`);
 
     try {
-      let parsed;
-      try {
-        parsed = await fetchFcResearchDirect(source);
-        addLog('Direct FCResearch Inventory response received.');
-      } catch (directError) {
-        addLog(`Direct request failed: ${directError.message || directError}. Trying tab fallback...`, true);
-        setStatus('Direct FCResearch request failed. Trying tab fallback...');
-        parsed = await fetchFcResearchViaTabBridge(source);
-        parsed.method = 'tab-fallback';
-      }
-
+      const parsed = await fetchFcResearchViaTabBridge(source);
       if (!parsed.lines || !parsed.lines.length) {
         setStatus(`No CUSTOMER_SHIPMENT FCSku found for ${source}. List unchanged.`, true);
-        addLog(`FCResearch found 0 CUSTOMER_SHIPMENT rows for ${source} using ${parsed.method || 'unknown method'}.`, true);
+        addLog(`FCResearch found 0 CUSTOMER_SHIPMENT rows for ${source}.`, true);
         return;
       }
-
       list.value = parsed.lines.join('\n');
       list.dispatchEvent(new Event('input', { bubbles: true }));
       saveUi();
       refreshSummary();
-
-      const methodLabel = parsed.method === 'direct-inventory' ? 'direct Inventory call' : 'tab fallback';
-      setStatus(`Loaded ${parsed.lines.length} CUSTOMER_SHIPMENT item barcode(s) using ${methodLabel}.`);
-      addLog(`Loaded ${parsed.lines.length} item barcode(s) using ${methodLabel}; skipped ${parsed.skippedRows || 0} non-customer/other rows.`);
+      setStatus(`Loaded ${parsed.lines.length} CUSTOMER_SHIPMENT item barcode(s) from FCResearch tab.`);
+      addLog(`FCResearch tab loaded ${parsed.lines.length} item barcode(s); skipped ${parsed.skippedRows || 0} non-customer/other rows.`);
     } catch (e) {
       setStatus(e.message || String(e), true);
       addLog(e.message || String(e), true);
@@ -781,6 +746,145 @@
       }
     } else {
       setStatus(`Finished. Moved ${state.index}/${total} scans.`);
+    }
+  }
+
+
+  function getMoveItemsApiId() {
+    const appState = getAState() || {};
+    const objectId = appState.objectId || matchOne(document.documentElement.innerHTML, /"objectId"\s*:\s*"([^"]+)"/i);
+    const instructionId = appState.instructionId || 'MoveItems';
+    if (!objectId) return null;
+    return { instructionId, objectId };
+  }
+
+  async function moveItemsApiPost(path, payload) {
+    const res = await fetch(path, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'accept': 'application/json, text/javascript, */*; q=0.01',
+        'content-type': 'application/json; charset=UTF-8',
+        'x-requested-with': 'XMLHttpRequest'
+      },
+      body: JSON.stringify(payload)
+    });
+    const text = await res.text().catch(() => '');
+    if (!res.ok) throw new Error(`${path} failed: HTTP ${res.status}`);
+    if (!text) return {};
+    try { return JSON.parse(text); }
+    catch { return { raw: text }; }
+  }
+
+  async function moveItemsApiStatus(id) {
+    return moveItemsApiPost('/status', { id });
+  }
+
+  async function waitForBackendReady(id, label = 'action') {
+    const start = Date.now();
+    let lastStatus = '';
+    while (Date.now() - start < READY_MAX_MS) {
+      const res = await moveItemsApiStatus(id);
+      const status = String(res.status || res.state || res.raw || '').toUpperCase();
+      if (status) lastStatus = status;
+      if (!status || status === 'READY' || status === 'COMPLETE' || status === 'COMPLETED' || status === 'DONE') return status || 'READY';
+      if (status === 'ERROR' || status === 'FAILED' || status === 'EXCEPTION') throw new Error(`MoveItems backend returned ${status} after ${label}.`);
+      await sleep(READY_POLL_MS);
+    }
+    throw new Error(`Timed out waiting for backend ready after ${label}. Last status: ${lastStatus || 'unknown'}`);
+  }
+
+  async function submitBackendAction(id, action, input, label) {
+    if (IS_LOCAL_FILE) {
+      addLog(`LOCAL TEST API: would ${action}: ${input}`);
+      return 'LOCAL';
+    }
+    await moveItemsApiPost('/action', { id, action, input });
+    state.lastSubmitAt = Date.now();
+    return waitForBackendReady(id, label || `${action}:${input}`);
+  }
+
+  async function finishBackendRun(id) {
+    const total = state.queue.length;
+    state.running = false;
+    state.paused = false;
+    state.stopRequested = false;
+    clearRun();
+    clearFnskuOnlyAfterFinish();
+    setButtons();
+    refreshSummary();
+    addLog(`Finished queue by backend API: ${state.index}/${total}`);
+    beep('ok');
+
+    const settings = getJobSettings();
+    if (settings.autoChangeContainer) {
+      try {
+        addLog('Backend API: Change container / Done.');
+        setStatus('Finished. Changing container by backend API...');
+        await submitBackendAction(id, 'Done', 'Done', 'change-container');
+        sessionStorage.setItem(FOCUS_AFTER_CHANGE_KEY, '1');
+        setStatus('Finished. Changed container. Reloading ready page...');
+        setTimeout(() => { location.href = '/app/moveitems?experience=Desktop'; }, 350);
+      } catch (e) {
+        setStatus('Finished, but backend Change container failed. Press d manually.', true);
+        addLog(`Backend Change container failed: ${e.message || e}`, true);
+      }
+    } else {
+      setStatus(`Finished. Moved ${state.index}/${total} scans.`);
+    }
+  }
+
+  async function runBackendLoop() {
+    if (state.busy) return;
+    state.busy = true;
+    try {
+      const id = getMoveItemsApiId();
+      if (!id) throw new Error('MoveItems objectId not found. Refresh MoveItems page and try again.');
+      const settings = getJobSettings();
+      addLog(`Backend API mode active. Object: ${id.objectId}`);
+
+      let det = detectStep();
+      if (det.step === 'error') throw new Error(det.reason || 'MoveItems page has an error.');
+
+      if (det.step === 'source') {
+        addLog(`Backend API source: ${settings.source}`);
+        persistRun({ active: true, paused: false, backendMode: true, lastStep: 'backend-source', lastValue: settings.source, expectedNext: 'item' });
+        await submitBackendAction(id, 'Input', settings.source, 'source');
+        await sleep(Math.max(300, Math.floor(settings.delay / 3)));
+      } else {
+        addLog(`Backend API: source step skipped because current page step is ${det.step}.`);
+      }
+
+      while (state.running && !state.paused && !state.stopRequested) {
+        refreshSummary();
+        if (state.index >= state.queue.length) {
+          await finishBackendRun(id);
+          break;
+        }
+
+        const current = state.queue[state.index];
+        addLog(`Backend item ${state.index + 1}/${state.queue.length}: ${current.fnsku}${current.qty > 1 ? ` (${current.copy}/${current.qty})` : ''}`);
+        persistRun({ active: true, paused: false, backendMode: true, lastStep: 'backend-item', lastValue: current.fnsku, expectedNext: 'dest' });
+        await submitBackendAction(id, 'Input', current.fnsku, 'item');
+        await sleep(Math.max(250, Math.floor(settings.delay / 3)));
+
+        addLog(`Backend destination for ${current.fnsku}: ${settings.dest}`);
+        state.index += 1;
+        persistRun({ active: true, paused: false, backendMode: true, lastStep: 'backend-destination', lastValue: settings.dest, completedFnsku: current.fnsku, expectedNext: 'item' });
+        await submitBackendAction(id, 'Input', settings.dest, 'destination');
+        await sleep(Math.max(350, settings.delay));
+      }
+    } catch (e) {
+      state.paused = true;
+      state.running = true;
+      persistRun({ active: false, paused: true, backendMode: true, lastStep: 'backend-exception', lastError: e.message || String(e) });
+      setStatus(e.message || String(e), true);
+      addLog(e.message || String(e), true);
+      beep('bad');
+      setButtons();
+    } finally {
+      state.busy = false;
+      refreshSummary();
     }
   }
 
@@ -897,6 +1001,7 @@
       delay: Math.max(700, parseInt($('#mib-delay')?.value || '1500', 10) || 1500),
       skipSourceIfPresent: $('#mib-skipsource')?.checked ?? true,
       smartWait: $('#mib-smartwait')?.checked ?? true,
+      backendMode: $('#mib-backendmode')?.checked ?? true,
       autoChangeContainer: $('#mib-autochangec')?.checked ?? true
     };
   }
@@ -1064,7 +1169,7 @@
     if (IS_LOCAL_FILE) {
       addLog('Local file mode: script will only simulate submissions. Open live MoveItems for real movement.');
     } else {
-      const msg = `Start bulk move?\n\nSource: ${settings.source}\nDestination: ${settings.dest}\nMove scans: ${rows.length}\n\nThis will submit through MoveItems one by one.`;
+      const msg = `Start bulk move?\n\nSource: ${settings.source}\nDestination: ${settings.dest}\nMove scans: ${rows.length}\nMode: ${settings.backendMode ? 'Backend API / no refresh' : 'Normal page input'}\n\nThis will submit through MoveItems one by one.`;
       if (!confirm(msg)) return;
     }
 
@@ -1077,8 +1182,9 @@
     persistRun({ active: true, paused: false, lastStep: 'started' });
     setButtons();
     addLog(`Started: ${rows.length} move scans from ${settings.source} to ${settings.dest}`);
-    setStatus('Running...');
-    runLoop();
+    setStatus(settings.backendMode ? 'Running backend API mode...' : 'Running...');
+    if (settings.backendMode) runBackendLoop();
+    else runLoop();
   }
 
   function pauseRun() {
@@ -1096,9 +1202,11 @@
     state.running = true;
     persistRun({ active: true, paused: false, lastStep: 'manual-resume' });
     setButtons();
-    setStatus('Running...');
+    const settings = getJobSettings();
+    setStatus(settings.backendMode ? 'Running backend API mode...' : 'Running...');
     addLog('Resumed');
-    runLoop();
+    if (settings.backendMode) runBackendLoop();
+    else runLoop();
   }
 
   function stopRun() {
@@ -1285,7 +1393,7 @@
 
         <div class="mib-fnsku-top">
           <label>FNSKUs <span>one per line / x2</span></label>
-          <button id="mib-fetchfc" type="button" title="Request FCResearch Inventory directly and import CUSTOMER_SHIPMENT item barcodes">FC</button>
+          <button id="mib-fetchfc" type="button" title="Open FCResearch tab and import CUSTOMER_SHIPMENT item barcodes for the source">FC</button>
         </div>
         <textarea id="mib-list" placeholder="Scan, paste, or use FC:
 ZZVKJ98QBU
@@ -1310,8 +1418,9 @@ B012345678 x2">${escapeHtml(saved.list || '')}</textarea>
             <label><input type="checkbox" id="mib-pauseerrors" ${saved.pauseErrors !== false ? 'checked' : ''}> Pause on error</label>
             <label><input type="checkbox" id="mib-skipsource" ${saved.skipSourceIfPresent !== false ? 'checked' : ''}> Skip source if already selected</label>
             <label><input type="checkbox" id="mib-smartwait" ${saved.smartWait !== false ? 'checked' : ''}> Slow page safe wait</label>
+            <label><input type="checkbox" id="mib-backendmode" ${saved.backendMode !== false ? 'checked' : ''}> Backend API mode / no refresh</label>
             <label><input type="checkbox" id="mib-autochangec" ${saved.autoChangeContainer !== false ? 'checked' : ''}> Change container when finished</label>
-            <label><input type="checkbox" id="mib-autofcfetch" ${saved.fcAutoFetch !== false ? 'checked' : ''}> Auto fetch from FCResearch Inventory when source entered</label>
+            <label><input type="checkbox" id="mib-autofcfetch" ${saved.fcAutoFetch !== false ? 'checked' : ''}> Auto fetch from FCResearch tab when source entered</label>
           </div>
           <div class="mib-delay-row">
             <label>Delay</label>
@@ -1326,7 +1435,7 @@ B012345678 x2">${escapeHtml(saved.list || '')}</textarea>
             <button id="mib-demo" type="button">Example</button>
             <button id="mib-copylog" type="button">Copy log</button>
           </div>
-          <div class="mib-note">Auto-resume: ON · Direct FC Inventory + tab fallback · CUSTOMER_SHIPMENT only</div>
+          <div class="mib-note">Auto-resume: ON · FC tab bridge · CUSTOMER_SHIPMENT only</div>
           <div id="mib-log"></div>
         </details>
       </div>
@@ -1382,7 +1491,7 @@ B012345678 x2">${escapeHtml(saved.list || '')}</textarea>
     $('#mib-source-preset')?.addEventListener('change', () => applyPreset('source'));
     $('#mib-dest-preset')?.addEventListener('change', () => applyPreset('dest'));
 
-    ['#mib-source','#mib-dest','#mib-list','#mib-delay','#mib-repeatqty','#mib-pauseerrors','#mib-skipsource','#mib-smartwait','#mib-autochangec','#mib-autofcfetch','#mib-source-presets','#mib-dest-presets'].forEach(sel => {
+    ['#mib-source','#mib-dest','#mib-list','#mib-delay','#mib-repeatqty','#mib-pauseerrors','#mib-skipsource','#mib-smartwait','#mib-backendmode','#mib-autochangec','#mib-autofcfetch','#mib-source-presets','#mib-dest-presets'].forEach(sel => {
       const el = $(sel);
       if (el) el.addEventListener('input', () => { saveUi(); refreshPresetSelects(); refreshSummary(); });
       if (el) el.addEventListener('change', () => { saveUi(); refreshPresetSelects(); refreshSummary(); });

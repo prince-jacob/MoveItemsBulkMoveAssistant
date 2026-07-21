@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MoveItems Bulk Move Assistant - NCL1
 // @namespace    PrinceJacob-Amazon
-// @version      2.1.0
-// @description  Ultra compact bulk helper for AFT MoveItems with optional backend API mode, FCResearch tab-bridge CUSTOMER_SHIPMENT auto-fill, presets, qty list, auto-resume, and auto Change container.
+// @version      2.2.0
+// @description  Ultra compact bulk helper for AFT MoveItems with optional backend API mode, FCResearch fast-fetch-first CUSTOMER_SHIPMENT auto-fill with tab bridge fallback, presets, qty list, auto-resume, and auto Change container.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://github.com/prince-jacob/MoveItemsBulkMoveAssistant/raw/refs/heads/main/MoveItemsBulkMoveAssistant.user.js
 // @downloadURL  https://github.com/prince-jacob/MoveItemsBulkMoveAssistant/raw/refs/heads/main/MoveItemsBulkMoveAssistant.user.js
@@ -37,6 +37,7 @@
    **********************************************************************/
 
   const CREATOR = 'Creator: Prince Jacob (Wprijaco)';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '2.2.0';
   const STORE_KEY = 'pj_moveitems_bulk_v12';
   const RUN_KEY = 'pj_moveitems_bulk_run_v13';
   const IS_LOCAL_FILE = location.protocol === 'file:';
@@ -609,6 +610,9 @@
         url,
         anonymous: false,
         timeout: 30000,
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        },
         onload: res => {
           if (res.status >= 200 && res.status < 300) resolve(res.responseText || '');
           else reject(new Error(`FCResearch returned HTTP ${res.status}`));
@@ -617,6 +621,27 @@
         onerror: () => reject(new Error('FCResearch request failed.'))
       });
     });
+  }
+
+  function isFcResearchLoginPage(htmlText) {
+    const text = decodeHtmlText(String(htmlText || '').replace(/<script[\s\S]*?<\/script>/gi, ' '));
+    const hasResultWords = /CUSTOMER_SHIPMENT|UNOWNED|SELLABLE|data-row-id/i.test(String(htmlText || '') + ' ' + text);
+    const hasLoginWords = /midway|sign\s*in|login|authentication|identity|sentry|federate/i.test(text);
+    return hasLoginWords && !hasResultWords;
+  }
+
+  async function fetchFcResearchFast(source) {
+    const url = `${FCRESEARCH_BASE}${encodeURIComponent(source)}`;
+    const html = await gmGetText(url);
+    if (isFcResearchLoginPage(html)) {
+      const err = new Error('Fast FCResearch returned login page. Trying tab bridge fallback.');
+      err.code = 'FC_LOGIN';
+      throw err;
+    }
+    const parsed = parseFcResearchCustomerShipment(html, source);
+    parsed.method = 'fast';
+    parsed.url = url;
+    return parsed;
   }
 
 
@@ -683,36 +708,55 @@
     }
     if (!list) return;
     if (IS_LOCAL_FILE) {
-      setStatus('Local test: FCResearch tab bridge works only on live MoveItems page.', true);
+      setStatus('Local test: FCResearch works only on live MoveItems page.', true);
       addLog('Local test: FCResearch fetch skipped.', true);
       return;
     }
 
     const btn = $('#mib-fetchfc');
     if (btn) btn.disabled = true;
-    setStatus(`Opening FCResearch tab bridge for ${source}...`);
-    addLog(`FCResearch tab bridge started for ${source} (${reason}).`);
+    setStatus(`Fast FCResearch fetch for ${source}...`);
+    addLog(`FCResearch fast fetch started for ${source} (${reason}).`);
+
+    let parsed = null;
+    let usedFallback = false;
 
     try {
-      const parsed = await fetchFcResearchViaTabBridge(source);
-      if (!parsed.lines || !parsed.lines.length) {
-        setStatus(`No CUSTOMER_SHIPMENT FCSku found for ${source}. List unchanged.`, true);
-        addLog(`FCResearch found 0 CUSTOMER_SHIPMENT rows for ${source}.`, true);
+      // Fast path: background request. This is quickest when FCResearch accepts the browser/Midway session.
+      parsed = await fetchFcResearchFast(source);
+      addLog(`FCResearch fast fetch OK for ${source}.`);
+    } catch (fastErr) {
+      usedFallback = true;
+      addLog(`${fastErr.message || fastErr} Falling back to tab bridge.`, true);
+      setStatus(`Fast fetch failed. Opening FCResearch tab fallback for ${source}...`, true);
+
+      try {
+        parsed = await fetchFcResearchViaTabBridge(source);
+        parsed.method = 'tab';
+      } catch (tabErr) {
+        setStatus(tabErr.message || String(tabErr), true);
+        addLog(tabErr.message || String(tabErr), true);
+        beep('bad');
         return;
       }
-      list.value = parsed.lines.join('\n');
-      list.dispatchEvent(new Event('input', { bubbles: true }));
-      saveUi();
-      refreshSummary();
-      setStatus(`Loaded ${parsed.lines.length} CUSTOMER_SHIPMENT item barcode(s) from FCResearch tab.`);
-      addLog(`FCResearch tab loaded ${parsed.lines.length} item barcode(s); skipped ${parsed.skippedRows || 0} non-customer/other rows.`);
-    } catch (e) {
-      setStatus(e.message || String(e), true);
-      addLog(e.message || String(e), true);
-      beep('bad');
     } finally {
       if (btn) btn.disabled = false;
     }
+
+    if (!parsed || !parsed.lines || !parsed.lines.length) {
+      setStatus(`No CUSTOMER_SHIPMENT FCSku found for ${source}. List unchanged.`, true);
+      addLog(`FCResearch found 0 CUSTOMER_SHIPMENT rows for ${source}.`, true);
+      return;
+    }
+
+    list.value = parsed.lines.join('\n');
+    list.dispatchEvent(new Event('input', { bubbles: true }));
+    saveUi();
+    refreshSummary();
+
+    const methodText = parsed.method === 'fast' ? 'fast fetch' : 'tab bridge';
+    setStatus(`Loaded ${parsed.lines.length} CUSTOMER_SHIPMENT item barcode(s) by ${methodText}.`);
+    addLog(`FCResearch ${methodText} loaded ${parsed.lines.length} item barcode(s); skipped ${parsed.skippedRows || 0} non-customer/other rows.${usedFallback ? ' Fallback used.' : ''}`);
   }
 
   function maybeAutoFetchFromSource(reason = 'source-enter') {
@@ -1369,7 +1413,7 @@
     box.id = 'mib-panel';
     box.innerHTML = `
       <div id="mib-head">
-        <div class="mib-title"><b>MI Bulk <span id="mib-local">${IS_LOCAL_FILE ? 'LOCAL' : ''}</span> <span id="mib-mini-progress"></span></b></div>
+        <div class="mib-title"><b>MI Bulk <span class="mib-ver">v${escapeHtml(SCRIPT_VERSION)}</span> <span id="mib-local">${IS_LOCAL_FILE ? 'LOCAL' : ''}</span> <span id="mib-mini-progress"></span></b></div>
         <div class="mib-head-actions">
           <button id="mib-fit" type="button" title="Reset size">↔</button>
           <button id="mib-min" type="button" title="Minimize">−</button>
@@ -1393,7 +1437,7 @@
 
         <div class="mib-fnsku-top">
           <label>FNSKUs <span>one per line / x2</span></label>
-          <button id="mib-fetchfc" type="button" title="Open FCResearch tab and import CUSTOMER_SHIPMENT item barcodes for the source">FC</button>
+          <button id="mib-fetchfc" type="button" title="Fast FCResearch import first; opens tab bridge only if fallback is needed">FC</button>
         </div>
         <textarea id="mib-list" placeholder="Scan, paste, or use FC:
 ZZVKJ98QBU
@@ -1420,7 +1464,7 @@ B012345678 x2">${escapeHtml(saved.list || '')}</textarea>
             <label><input type="checkbox" id="mib-smartwait" ${saved.smartWait !== false ? 'checked' : ''}> Slow page safe wait</label>
             <label><input type="checkbox" id="mib-backendmode" ${saved.backendMode !== false ? 'checked' : ''}> Backend API mode / no refresh</label>
             <label><input type="checkbox" id="mib-autochangec" ${saved.autoChangeContainer !== false ? 'checked' : ''}> Change container when finished</label>
-            <label><input type="checkbox" id="mib-autofcfetch" ${saved.fcAutoFetch !== false ? 'checked' : ''}> Auto fetch from FCResearch tab when source entered</label>
+            <label><input type="checkbox" id="mib-autofcfetch" ${saved.fcAutoFetch !== false ? 'checked' : ''}> Auto fetch from FCResearch when source entered</label>
           </div>
           <div class="mib-delay-row">
             <label>Delay</label>
@@ -1435,7 +1479,7 @@ B012345678 x2">${escapeHtml(saved.list || '')}</textarea>
             <button id="mib-demo" type="button">Example</button>
             <button id="mib-copylog" type="button">Copy log</button>
           </div>
-          <div class="mib-note">Auto-resume: ON · FC tab bridge · CUSTOMER_SHIPMENT only</div>
+          <div class="mib-note">Auto-resume: ON · FC fast fetch first · tab fallback</div>
           <div id="mib-log"></div>
         </details>
       </div>
@@ -1449,9 +1493,9 @@ B012345678 x2">${escapeHtml(saved.list || '')}</textarea>
       #mib-panel{position:fixed;right:8px;top:54px;z-index:2147483647;width:270px;height:auto;min-width:240px;min-height:190px;max-width:calc(100vw - 10px);max-height:calc(100vh - 10px);background:#05070b;color:#e5e7eb;border:1px solid #1f2937;border-radius:9px;box-shadow:0 8px 24px #000a;font-family:Arial,Helvetica,sans-serif;font-size:11px;overflow:hidden;display:flex;flex-direction:column;box-sizing:border-box}
       #mib-panel *{box-sizing:border-box} #mib-panel.mib-resizing,#mib-panel.mib-dragging{user-select:none}
       #mib-head{cursor:move;background:#070b12;padding:5px 7px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #1f2937;gap:6px;flex:0 0 auto;min-height:28px}
-      .mib-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mib-title b{font-size:12px;display:block;line-height:1}.mib-title #mib-mini-progress{color:#9ca3af;font-weight:700;margin-left:4px}#mib-local{font-size:9px;color:#fbbf24;margin-left:3px}
+      .mib-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mib-title b{font-size:12px;display:block;line-height:1}.mib-title #mib-mini-progress{color:#9ca3af;font-weight:700;margin-left:4px}.mib-ver{font-size:9px;color:#93c5fd;margin-left:3px}#mib-local{font-size:9px;color:#fbbf24;margin-left:3px}
       .mib-head-actions{display:flex;align-items:center;gap:4px;flex:0 0 auto}#mib-min,#mib-fit{background:#111827;color:#d1d5db;border:1px solid #263244;border-radius:5px;width:22px;height:18px;cursor:pointer;font-size:10px;padding:0;line-height:1}
-      #mib-body{padding:6px 7px;overflow:auto;flex:1 1 auto;min-height:0;scrollbar-width:thin}#mib-panel.mib-collapsed{width:168px!important;height:30px!important;min-width:168px!important;min-height:30px!important;max-height:30px!important;border-radius:999px}#mib-panel.mib-collapsed #mib-body,#mib-panel.mib-collapsed #mib-resize-grip,#mib-panel.mib-collapsed #mib-fit{display:none}#mib-panel.mib-collapsed #mib-head{border-bottom:0;min-height:28px;padding:5px 8px;cursor:move}#mib-panel.mib-collapsed .mib-title b{font-size:11px}
+      #mib-body{padding:6px 7px;overflow:auto;flex:1 1 auto;min-height:0;scrollbar-width:thin}#mib-panel.mib-collapsed{width:188px!important;height:30px!important;min-width:188px!important;min-height:30px!important;max-height:30px!important;border-radius:999px}#mib-panel.mib-collapsed #mib-body,#mib-panel.mib-collapsed #mib-resize-grip,#mib-panel.mib-collapsed #mib-fit{display:none}#mib-panel.mib-collapsed #mib-head{border-bottom:0;min-height:28px;padding:5px 8px;cursor:move}#mib-panel.mib-collapsed .mib-title b{font-size:11px}
       .mib-hint{font-size:10px;color:#9ca3af;margin-bottom:4px;line-height:1.1}
       #mib-page-error{display:none;background:#260b0b;color:#fecaca;border:1px solid #7f1d1d;border-radius:6px;padding:4px 5px;margin-bottom:5px;line-height:1.2;font-size:10px}
       #mib-panel label{display:block;color:#aab4c5;font-weight:700;margin-top:4px;margin-bottom:2px;font-size:10px;line-height:1} #mib-panel label span{font-weight:400;color:#6b7280}

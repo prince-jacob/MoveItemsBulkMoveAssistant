@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MoveItems Bulk Move Assistant - NCL1
 // @namespace    PrinceJacob-Amazon
-// @version      2.3.0
-// @description  Ultra compact bulk helper for AFT MoveItems with backend API mode and restored stable FCResearch tab-bridge CUSTOMER_SHIPMENT auto-fill, presets, qty list, auto-resume, and auto Change container.
+// @version      2.4.0
+// @description  Ultra compact bulk helper for AFT MoveItems with MoveItems backend API mode and FCResearch inventory backend API CUSTOMER_SHIPMENT auto-fill, presets, qty list, auto-resume, and auto Change container.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://github.com/prince-jacob/MoveItemsBulkMoveAssistant/raw/refs/heads/main/MoveItemsBulkMoveAssistant.user.js
 // @downloadURL  https://github.com/prince-jacob/MoveItemsBulkMoveAssistant/raw/refs/heads/main/MoveItemsBulkMoveAssistant.user.js
@@ -50,6 +50,7 @@
   const AUTO_RESUME_MAX_AGE_MS = 45 * 60 * 1000;
   const FOCUS_AFTER_CHANGE_KEY = 'pj_moveitems_focus_source_after_change';
   const FCRESEARCH_BASE = 'https://qi-fcresearch-eu.corp.amazon.com/NCL1/results?s=';
+  const FCRESEARCH_INVENTORY_API = 'https://qi-fcresearch-eu.corp.amazon.com/NCL1/results/inventory';
   const IS_FCRESEARCH_PAGE = location.hostname === 'qi-fcresearch-eu.corp.amazon.com';
   const FC_BRIDGE_REQ_KEY = 'pj_mi_fcresearch_bridge_request_v20';
   const FC_BRIDGE_RES_KEY = 'pj_mi_fcresearch_bridge_response_v20';
@@ -599,17 +600,18 @@
     return { lines, customerRows, skippedRows };
   }
 
-  function gmGetText(url) {
+  function gmRequestText(opts) {
     return new Promise((resolve, reject) => {
       if (typeof GM_xmlhttpRequest !== 'function') {
         reject(new Error('GM_xmlhttpRequest not available. Check Tampermonkey permissions.'));
         return;
       }
       GM_xmlhttpRequest({
-        method: 'GET',
-        url,
         anonymous: false,
+        withCredentials: true,
         timeout: 30000,
+        responseType: 'text',
+        ...opts,
         onload: res => {
           if (res.status >= 200 && res.status < 300) resolve(res.responseText || '');
           else reject(new Error(`FCResearch returned HTTP ${res.status}`));
@@ -618,6 +620,68 @@
         onerror: () => reject(new Error('FCResearch request failed.'))
       });
     });
+  }
+
+  function gmGetText(url) {
+    return gmRequestText({
+      method: 'GET',
+      url,
+      headers: {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
+      }
+    });
+  }
+
+  function gmPostFormText(url, formBody) {
+    return gmRequestText({
+      method: 'POST',
+      url,
+      data: formBody,
+      headers: {
+        'Accept': 'text/html, */*; q=0.01',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
+      }
+    });
+  }
+
+  function isFcResearchLoginPage(htmlText) {
+    const text = decodeHtmlText(String(htmlText || '').replace(/<script[\s\S]*?<\/script>/gi, ' '));
+    const resultWords = /CUSTOMER_SHIPMENT|UNOWNED|SELLABLE|data-row-id|section-title[^>]*>Inventory/i.test(String(htmlText || '') + ' ' + text);
+    const loginWords = /midway|sign\s*in|login|authentication|identity|federate|sentry/i.test(text);
+    return loginWords && !resultWords;
+  }
+
+  async function fetchFcResearchInventoryApi(source) {
+    // HAR-confirmed fast endpoint:
+    // POST https://qi-fcresearch-eu.corp.amazon.com/NCL1/results/inventory
+    // Body: s=<source>, Content-Type: application/x-www-form-urlencoded, X-Requested-With: XMLHttpRequest
+    const form = `s=${encodeURIComponent(source)}`;
+    let html = await gmPostFormText(FCRESEARCH_INVENTORY_API, form);
+
+    if (isFcResearchLoginPage(html)) {
+      const err = new Error('FCResearch inventory API returned login page. Open FCResearch once and retry, or use tab fallback.');
+      err.code = 'FC_LOGIN';
+      throw err;
+    }
+
+    let parsed = parseFcResearchCustomerShipment(html, source);
+    if (!parsed.lines.length && !/CUSTOMER_SHIPMENT|UNOWNED|SELLABLE|data-row-id/i.test(html || '')) {
+      await gmGetText(`${FCRESEARCH_BASE}${encodeURIComponent(source)}`);
+      html = await gmPostFormText(FCRESEARCH_INVENTORY_API, form);
+      if (isFcResearchLoginPage(html)) {
+        const err = new Error('FCResearch inventory API returned login page after warm-up.');
+        err.code = 'FC_LOGIN';
+        throw err;
+      }
+      parsed = parseFcResearchCustomerShipment(html, source);
+    }
+    parsed.method = 'inventory API';
+    return parsed;
   }
 
 
@@ -684,36 +748,53 @@
     }
     if (!list) return;
     if (IS_LOCAL_FILE) {
-      setStatus('Local test: FCResearch tab bridge works only on live MoveItems page.', true);
+      setStatus('Local test: FCResearch API works only on live MoveItems page.', true);
       addLog('Local test: FCResearch fetch skipped.', true);
       return;
     }
 
     const btn = $('#mib-fetchfc');
     if (btn) btn.disabled = true;
-    setStatus(`Opening FCResearch tab bridge for ${source}...`);
-    addLog(`FCResearch tab bridge started for ${source} (${reason}).`);
+    setStatus(`FCResearch inventory API fetch for ${source}...`);
+    addLog(`FCResearch inventory API started for ${source} (${reason}).`);
+
+    let parsed = null;
+    let usedFallback = false;
 
     try {
-      const parsed = await fetchFcResearchViaTabBridge(source);
-      if (!parsed.lines || !parsed.lines.length) {
-        setStatus(`No CUSTOMER_SHIPMENT FCSku found for ${source}. List unchanged.`, true);
-        addLog(`FCResearch found 0 CUSTOMER_SHIPMENT rows for ${source}.`, true);
+      parsed = await fetchFcResearchInventoryApi(source);
+      addLog(`FCResearch inventory API OK for ${source}.`);
+    } catch (apiErr) {
+      usedFallback = true;
+      addLog(`${apiErr.message || apiErr} Trying tab fallback.`, true);
+      setStatus(`FC API failed. Trying FCResearch tab fallback for ${source}...`, true);
+      try {
+        parsed = await fetchFcResearchViaTabBridge(source);
+        parsed.method = 'tab fallback';
+      } catch (tabErr) {
+        setStatus(tabErr.message || String(tabErr), true);
+        addLog(tabErr.message || String(tabErr), true);
+        beep('bad');
         return;
       }
-      list.value = parsed.lines.join('\n');
-      list.dispatchEvent(new Event('input', { bubbles: true }));
-      saveUi();
-      refreshSummary();
-      setStatus(`Loaded ${parsed.lines.length} CUSTOMER_SHIPMENT item barcode(s) from FCResearch tab.`);
-      addLog(`FCResearch tab loaded ${parsed.lines.length} item barcode(s); skipped ${parsed.skippedRows || 0} non-customer/other rows.`);
-    } catch (e) {
-      setStatus(e.message || String(e), true);
-      addLog(e.message || String(e), true);
-      beep('bad');
     } finally {
       if (btn) btn.disabled = false;
     }
+
+    if (!parsed || !parsed.lines || !parsed.lines.length) {
+      setStatus(`No CUSTOMER_SHIPMENT FCSku found for ${source}. List unchanged.`, true);
+      addLog(`FCResearch found 0 CUSTOMER_SHIPMENT rows for ${source}.`, true);
+      return;
+    }
+
+    list.value = parsed.lines.join('\n');
+    list.dispatchEvent(new Event('input', { bubbles: true }));
+    saveUi();
+    refreshSummary();
+
+    const methodText = parsed.method || 'inventory API';
+    setStatus(`Loaded ${parsed.lines.length} CUSTOMER_SHIPMENT item barcode(s) by ${methodText}.`);
+    addLog(`FCResearch ${methodText} loaded ${parsed.lines.length} item barcode(s); skipped ${parsed.skippedRows || 0} non-customer/other rows.${usedFallback ? ' Fallback used.' : ''}`);
   }
 
   function maybeAutoFetchFromSource(reason = 'source-enter') {
@@ -1324,7 +1405,7 @@
           refreshPresetSelects();
           maybeAutoFetchFromSource('source-enter');
           focusAndSelect(dest);
-          setStatus('Source saved. Scan destination. Fetching FCResearch if enabled.');
+          setStatus('Source saved. Scan destination. FC API fetch if enabled.');
         }
       });
     }
@@ -1394,7 +1475,7 @@
 
         <div class="mib-fnsku-top">
           <label>FNSKUs <span>one per line / x2</span></label>
-          <button id="mib-fetchfc" type="button" title="Open FCResearch tab and import CUSTOMER_SHIPMENT item barcodes for the source">FC</button>
+          <button id="mib-fetchfc" type="button" title="Fetch FCResearch inventory API and import CUSTOMER_SHIPMENT item barcodes for the source">FC</button>
         </div>
         <textarea id="mib-list" placeholder="Scan, paste, or use FC:
 ZZVKJ98QBU
@@ -1421,7 +1502,7 @@ B012345678 x2">${escapeHtml(saved.list || '')}</textarea>
             <label><input type="checkbox" id="mib-smartwait" ${saved.smartWait !== false ? 'checked' : ''}> Slow page safe wait</label>
             <label><input type="checkbox" id="mib-backendmode" ${saved.backendMode !== false ? 'checked' : ''}> Backend API mode / no refresh</label>
             <label><input type="checkbox" id="mib-autochangec" ${saved.autoChangeContainer !== false ? 'checked' : ''}> Change container when finished</label>
-            <label><input type="checkbox" id="mib-autofcfetch" ${saved.fcAutoFetch !== false ? 'checked' : ''}> Auto fetch from FCResearch tab when source entered</label>
+            <label><input type="checkbox" id="mib-autofcfetch" ${saved.fcAutoFetch !== false ? 'checked' : ''}> Auto fetch from FCResearch API when source entered</label>
           </div>
           <div class="mib-delay-row">
             <label>Delay</label>
@@ -1436,7 +1517,7 @@ B012345678 x2">${escapeHtml(saved.list || '')}</textarea>
             <button id="mib-demo" type="button">Example</button>
             <button id="mib-copylog" type="button">Copy log</button>
           </div>
-          <div class="mib-note">Auto-resume: ON · stable FC tab bridge · backend API available</div>
+          <div class="mib-note">Auto-resume: ON · FC inventory API · tab fallback</div>
           <div id="mib-log"></div>
         </details>
       </div>

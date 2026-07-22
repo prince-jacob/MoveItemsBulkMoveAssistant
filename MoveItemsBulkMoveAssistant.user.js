@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MoveItems Bulk Move Assistant - NCL1
 // @namespace    PrinceJacob-Amazon
-// @version      2.4.0
-// @description  Ultra compact bulk helper for AFT MoveItems with MoveItems backend API mode and FCResearch inventory backend API CUSTOMER_SHIPMENT auto-fill, presets, qty list, auto-resume, and auto Change container.
+// @version      2.6.0
+// @description  Ultra compact bulk helper for AFT MoveItems with MoveItems backend API mode, FCResearch inventory API auto-fill, CUSTOMER_SHIPMENT duplicate selector, presets, qty list, auto-resume, and auto Change container.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://github.com/prince-jacob/MoveItemsBulkMoveAssistant/raw/refs/heads/main/MoveItemsBulkMoveAssistant.user.js
 // @downloadURL  https://github.com/prince-jacob/MoveItemsBulkMoveAssistant/raw/refs/heads/main/MoveItemsBulkMoveAssistant.user.js
@@ -68,7 +68,8 @@
     lastSubmitAt: 0,
     lastPrompt: '',
     stopRequested: false,
-    startTime: 0
+    startTime: 0,
+    customerSelectHints: {}
   };
 
 
@@ -247,6 +248,7 @@
       smartWait: $('#mib-smartwait')?.checked ?? true,
       backendMode: $('#mib-backendmode')?.checked ?? true,
       autoChangeContainer: $('#mib-autochangec')?.checked ?? true,
+      autoCustomerSelect: $('#mib-autocustomerselect')?.checked ?? true,
       fcAutoFetch: $('#mib-autofcfetch')?.checked ?? true,
       sourcePresets: $('#mib-source-presets')?.value || '',
       destPresets: $('#mib-dest-presets')?.value || '',
@@ -282,6 +284,7 @@
       smartWait: $('#mib-smartwait')?.checked ?? saved.smartWait ?? true,
       backendMode: $('#mib-backendmode')?.checked ?? saved.backendMode ?? true,
       autoChangeContainer: $('#mib-autochangec')?.checked ?? saved.autoChangeContainer ?? true,
+      autoCustomerSelect: $('#mib-autocustomerselect')?.checked ?? saved.autoCustomerSelect ?? true,
       fcAutoFetch: $('#mib-autofcfetch')?.checked ?? saved.fcAutoFetch ?? true,
       sourcePresets: $('#mib-source-presets')?.value ?? saved.sourcePresets ?? '',
       destPresets: $('#mib-dest-presets')?.value ?? saved.destPresets ?? '',
@@ -308,6 +311,7 @@
     if ($('#mib-smartwait')) $('#mib-smartwait').checked = run.smartWait !== false;
     if ($('#mib-backendmode')) $('#mib-backendmode').checked = run.backendMode !== false;
     if ($('#mib-autochangec')) $('#mib-autochangec').checked = run.autoChangeContainer !== false;
+    if ($('#mib-autocustomerselect')) $('#mib-autocustomerselect').checked = run.autoCustomerSelect !== false;
     if ($('#mib-autofcfetch')) $('#mib-autofcfetch').checked = run.fcAutoFetch !== false;
     const saved = getSaved();
     if ($('#mib-source-presets')) $('#mib-source-presets').value = run.sourcePresets ?? saved.sourcePresets ?? '';
@@ -561,6 +565,7 @@
   function parseFcResearchCustomerShipment(htmlText, source) {
     const sourceKey = String(source || '').trim().toLowerCase();
     const totals = new Map();
+    const itemSeen = new Map();
     let customerRows = 0;
     let skippedRows = 0;
 
@@ -573,12 +578,8 @@
 
       const container = (cells[0] || '').trim();
       const consumer = (cells[7] || '').trim().toUpperCase();
+      const disposition = (cells[6] || '').trim().toUpperCase();
       if (sourceKey && container && container.toLowerCase() !== sourceKey) {
-        skippedRows += 1;
-        continue;
-      }
-
-      if (consumer !== 'CUSTOMER_SHIPMENT') {
         skippedRows += 1;
         continue;
       }
@@ -590,14 +591,39 @@
       if (!itemBarcode && rowId.includes('-')) itemBarcode = rowId.split('-').pop().trim();
       if (!itemBarcode) continue;
 
-      const qtyMatch = String(cells[5] || '').match(/\d+/);
-      const qty = qtyMatch ? Math.max(1, parseInt(qtyMatch[0], 10)) : 1;
-      totals.set(itemBarcode, (totals.get(itemBarcode) || 0) + qty);
-      customerRows += 1;
+      const key = itemBarcode.toUpperCase();
+      const seen = itemSeen.get(key) || { customer: 0, other: 0, sellableCustomer: 0, dispositions: new Set(), owners: new Set() };
+      seen.owners.add(consumer || 'UNKNOWN');
+      if (disposition) seen.dispositions.add(disposition);
+
+      if (consumer === 'CUSTOMER_SHIPMENT') {
+        const qtyMatch = String(cells[5] || '').match(/\d+/);
+        const qty = qtyMatch ? Math.max(1, parseInt(qtyMatch[0], 10)) : 1;
+        totals.set(itemBarcode, (totals.get(itemBarcode) || 0) + qty);
+        customerRows += 1;
+        seen.customer += 1;
+        if (disposition === 'SELLABLE') seen.sellableCustomer += 1;
+      } else {
+        skippedRows += 1;
+        seen.other += 1;
+      }
+
+      itemSeen.set(key, seen);
+    }
+
+    const customerSelectHints = {};
+    let duplicateChoiceRows = 0;
+    for (const [key, seen] of itemSeen.entries()) {
+      // Same item barcode exists both as CUSTOMER_SHIPMENT and non-customer/damaged/unowned.
+      // MoveItems may show "Select item"; we will choose CUSTOMER_SHIPMENT automatically.
+      if (seen.customer > 0 && seen.other > 0) {
+        customerSelectHints[key] = true;
+        duplicateChoiceRows += 1;
+      }
     }
 
     const lines = Array.from(totals.entries()).map(([code, qty]) => qty > 1 ? `${code} x${qty}` : code);
-    return { lines, customerRows, skippedRows };
+    return { lines, customerRows, skippedRows, customerSelectHints, duplicateChoiceRows };
   }
 
   function gmRequestText(opts) {
@@ -781,6 +807,9 @@
       if (btn) btn.disabled = false;
     }
 
+    state.customerSelectHints = parsed.customerSelectHints || {};
+    const duplicateChoiceRows = parsed.duplicateChoiceRows || Object.keys(state.customerSelectHints || {}).length || 0;
+
     if (!parsed || !parsed.lines || !parsed.lines.length) {
       setStatus(`No CUSTOMER_SHIPMENT FCSku found for ${source}. List unchanged.`, true);
       addLog(`FCResearch found 0 CUSTOMER_SHIPMENT rows for ${source}.`, true);
@@ -794,7 +823,7 @@
 
     const methodText = parsed.method || 'inventory API';
     setStatus(`Loaded ${parsed.lines.length} CUSTOMER_SHIPMENT item barcode(s) by ${methodText}.`);
-    addLog(`FCResearch ${methodText} loaded ${parsed.lines.length} item barcode(s); skipped ${parsed.skippedRows || 0} non-customer/other rows.${usedFallback ? ' Fallback used.' : ''}`);
+    addLog(`FCResearch ${methodText} loaded ${parsed.lines.length} item barcode(s); skipped ${parsed.skippedRows || 0} non-customer/other rows.${duplicateChoiceRows ? ` ${duplicateChoiceRows} duplicate FCSKU choice hint(s).` : ''}${usedFallback ? ' Fallback used.' : ''}`);
   }
 
   function maybeAutoFetchFromSource(reason = 'source-enter') {
@@ -886,6 +915,100 @@
     return waitForBackendReady(id, label || `${action}:${input}`);
   }
 
+  function isCustomerShipmentSelectPage(root = document) {
+    const container = root.querySelector?.('#workflow') || root;
+    const text = cleanText(container).toUpperCase();
+    return /SELECT\s+ITEM/.test(text) && !!container.querySelector?.('input[type="radio"][name="options"]');
+  }
+
+  function getCustomerShipmentRadio(root = document, itemBarcode = '') {
+    const radios = Array.from(root.querySelectorAll?.('input[type="radio"][name="options"]') || []);
+    if (!radios.length) return null;
+
+    const code = String(itemBarcode || '').trim().toUpperCase();
+    const candidates = radios.map(radio => {
+      const box = radio.closest?.('.a-box') || radio.closest?.('label') || radio.parentElement;
+      const text = cleanText(box).toUpperCase();
+      let score = 0;
+      if (/CUSTOMER_SHIPMENT/.test(text)) score += 100;
+      if (/OWNER:\s*CUSTOMER_SHIPMENT/.test(text)) score += 50;
+      if (/SELLABLE/.test(text)) score += 15;
+      if (!/OWNER:\s*UNOWNED/.test(text) && !/UNOWNED/.test(text)) score += 10;
+      if (code && text.includes(code)) score += 5;
+      return { radio, score, text };
+    }).filter(x => x.score >= 100);
+
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates[0].radio;
+  }
+
+  function getCustomerShipmentChoiceValueFromHtml(htmlText, itemBarcode = '') {
+    try {
+      const doc = new DOMParser().parseFromString(String(htmlText || ''), 'text/html');
+      if (!isCustomerShipmentSelectPage(doc)) return null;
+      const radio = getCustomerShipmentRadio(doc, itemBarcode);
+      return radio ? String(radio.value ?? '') : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function fetchMoveItemsCurrentHtml() {
+    const res = await fetch('/app/moveitems?experience=Desktop', {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: {
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'cache-control': 'no-cache',
+        'pragma': 'no-cache'
+      }
+    });
+    const text = await res.text().catch(() => '');
+    if (!res.ok) throw new Error(`MoveItems page check failed: HTTP ${res.status}`);
+    return text;
+  }
+
+  function submitCustomerShipmentSelectionOnPage(itemBarcode = '') {
+    const radio = getCustomerShipmentRadio(document, itemBarcode);
+    if (!radio) return false;
+    radio.checked = true;
+    radio.dispatchEvent(new Event('input', { bubbles: true }));
+    radio.dispatchEvent(new Event('change', { bubbles: true }));
+    const form = radio.closest('form');
+    const btn = form?.querySelector?.('.a-button-input, input[type="submit"], button[type="submit"]');
+    if (btn) btn.click();
+    else form?.dispatchEvent?.(new Event('submit', { bubbles: true, cancelable: true }));
+    state.lastSubmitAt = Date.now();
+    return true;
+  }
+
+  async function maybeSubmitCustomerShipmentChoice(id, itemBarcode) {
+    const settings = getJobSettings();
+    if (!settings.autoCustomerSelect) return false;
+
+    const key = String(itemBarcode || '').trim().toUpperCase();
+    const hints = state.customerSelectHints || {};
+    if (!hints[key]) return false;
+
+    addLog(`Duplicate ${itemBarcode}: checking Select item page for CUSTOMER_SHIPMENT.`);
+    const html = await fetchMoveItemsCurrentHtml();
+    const choiceValue = getCustomerShipmentChoiceValueFromHtml(html, itemBarcode);
+
+    if (choiceValue === null) {
+      addLog(`No Select item page found for ${itemBarcode}; continuing normally.`);
+      return false;
+    }
+
+    if (choiceValue === '') throw new Error(`Select item appeared for ${itemBarcode}, but CUSTOMER_SHIPMENT option value was blank.`);
+
+    addLog(`Auto selected CUSTOMER_SHIPMENT for ${itemBarcode} (option ${choiceValue}).`);
+    await submitBackendAction(id, 'Input', choiceValue, 'customer-shipment-select');
+    await sleep(Math.max(250, Math.floor(settings.delay / 3)));
+    return true;
+  }
+
+
   async function finishBackendRun(id) {
     const total = state.queue.length;
     state.running = false;
@@ -949,6 +1072,7 @@
         persistRun({ active: true, paused: false, backendMode: true, lastStep: 'backend-item', lastValue: current.fnsku, expectedNext: 'dest' });
         await submitBackendAction(id, 'Input', current.fnsku, 'item');
         await sleep(Math.max(250, Math.floor(settings.delay / 3)));
+        await maybeSubmitCustomerShipmentChoice(id, current.fnsku);
 
         addLog(`Backend destination for ${current.fnsku}: ${settings.dest}`);
         state.index += 1;
@@ -1002,6 +1126,8 @@
     if (info.error && $('#mib-pauseerrors')?.checked) {
       return { step: 'error', info, reason: info.error };
     }
+
+    if (isCustomerShipmentSelectPage(document)) return { step: 'select', info };
 
     if (!currentInput()) {
       return { step: 'noinput', info, reason: 'No visible MoveItems input found.' };
@@ -1084,7 +1210,8 @@
       skipSourceIfPresent: $('#mib-skipsource')?.checked ?? true,
       smartWait: $('#mib-smartwait')?.checked ?? true,
       backendMode: $('#mib-backendmode')?.checked ?? true,
-      autoChangeContainer: $('#mib-autochangec')?.checked ?? true
+      autoChangeContainer: $('#mib-autochangec')?.checked ?? true,
+      autoCustomerSelect: $('#mib-autocustomerselect')?.checked ?? true
     };
   }
 
@@ -1141,8 +1268,10 @@
         }
 
         const settings = getJobSettings();
-        if (settings.smartWait) await waitForReadyToScan();
-        const det = detectStep();
+        const current = state.queue[state.index];
+        let det = detectStep();
+        if (settings.smartWait && det.step !== 'select') await waitForReadyToScan();
+        det = detectStep();
         const info = det.info;
 
         if (det.step === 'error') {
@@ -1153,6 +1282,16 @@
           addLog(`Paused because page error: ${det.reason}`, true);
           beep('bad');
           break;
+        }
+
+        if (det.step === 'select') {
+          addLog(`Select item page: choosing CUSTOMER_SHIPMENT for ${current?.fnsku || 'item'}.`);
+          persistRun({ active: true, paused: false, lastStep: 'select-customer-shipment', lastValue: current?.fnsku || '', expectedNext: 'dest' });
+          const selected = submitCustomerShipmentSelectionOnPage(current?.fnsku || '');
+          if (!selected) throw new Error('Select item page appeared but CUSTOMER_SHIPMENT option was not found.');
+          await waitForPageAdvance('select');
+          await sleep(settings.delay);
+          continue;
         }
 
         if (det.step === 'noinput' || det.step === 'unknown') {
@@ -1178,8 +1317,6 @@
           await sleep(settings.delay);
           continue;
         }
-
-        const current = state.queue[state.index];
 
         if (det.step === 'item') {
           if (settings.smartWait) await waitForReadyToScan('item');
@@ -1502,6 +1639,7 @@ B012345678 x2">${escapeHtml(saved.list || '')}</textarea>
             <label><input type="checkbox" id="mib-smartwait" ${saved.smartWait !== false ? 'checked' : ''}> Slow page safe wait</label>
             <label><input type="checkbox" id="mib-backendmode" ${saved.backendMode !== false ? 'checked' : ''}> Backend API mode / no refresh</label>
             <label><input type="checkbox" id="mib-autochangec" ${saved.autoChangeContainer !== false ? 'checked' : ''}> Change container when finished</label>
+            <label><input type="checkbox" id="mib-autocustomerselect" ${saved.autoCustomerSelect !== false ? 'checked' : ''}> Auto choose CUSTOMER_SHIPMENT on duplicate FCSKU</label>
             <label><input type="checkbox" id="mib-autofcfetch" ${saved.fcAutoFetch !== false ? 'checked' : ''}> Auto fetch from FCResearch API when source entered</label>
           </div>
           <div class="mib-delay-row">
@@ -1573,7 +1711,7 @@ B012345678 x2">${escapeHtml(saved.list || '')}</textarea>
     $('#mib-source-preset')?.addEventListener('change', () => applyPreset('source'));
     $('#mib-dest-preset')?.addEventListener('change', () => applyPreset('dest'));
 
-    ['#mib-source','#mib-dest','#mib-list','#mib-delay','#mib-repeatqty','#mib-pauseerrors','#mib-skipsource','#mib-smartwait','#mib-backendmode','#mib-autochangec','#mib-autofcfetch','#mib-source-presets','#mib-dest-presets'].forEach(sel => {
+    ['#mib-source','#mib-dest','#mib-list','#mib-delay','#mib-repeatqty','#mib-pauseerrors','#mib-skipsource','#mib-smartwait','#mib-backendmode','#mib-autochangec','#mib-autocustomerselect','#mib-autofcfetch','#mib-source-presets','#mib-dest-presets'].forEach(sel => {
       const el = $(sel);
       if (el) el.addEventListener('input', () => { saveUi(); refreshPresetSelects(); refreshSummary(); });
       if (el) el.addEventListener('change', () => { saveUi(); refreshPresetSelects(); refreshSummary(); });
